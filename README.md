@@ -18,6 +18,7 @@ python app.py --port 8010
 - 路径使用 Dijkstra 算法比较基线与方案版本；跳站时车辆可继续通过，但乘客不能在跳站上下车，经过省略路段的行驶时间会计入下一段。
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
+- 提交复核时会把草稿与已发布方案比对生效时段（事件日期范围与服务日分钟窗口）：涉及同一站或同一绕行起讫且时段重叠即写入冲突清单，记录冲突版本和具体变更。存在冲突的版本不能批准或发布，只能退回调整；再次提交按新内容重算，旧清单不保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
 
 ## API
@@ -28,7 +29,9 @@ python app.py --port 8010
 - `POST /api/disruptions`：创建中断事件及第一版草稿。
 - `POST /api/disruptions/{id}/versions`：从指定父版本复制出新草稿。
 - `POST /api/versions/{id}/changes`：向草稿添加停运、跳站、绕行或无障碍变化。
-- `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程。
+- `DELETE /api/changes/{id}`：从草稿移除变更，用于退回后调整。
+- `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程；`submit` 响应携带冲突清单，有冲突时 `approve`/`publish` 返回 409。
+- `GET /api/versions/{id}`：查看版本详情、变更和当前冲突清单。
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
 - `GET /api/import-errors`：查看被隔离的错误批次。
@@ -39,4 +42,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻、坏数据整批隔离，以及提交前冲突检测（同一站/同一绕行起讫、时段重叠判定、退回调整后重算）。

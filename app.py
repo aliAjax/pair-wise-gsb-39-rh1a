@@ -42,6 +42,22 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     return start <= value <= end
 
 
+def _change_stations(change: dict[str, Any]) -> set[int]:
+    """Stations a change touches: the target stop, or a detour's endpoints."""
+    stations: set[int] = set()
+    for key in ("stop_id", "from_stop_id", "to_stop_id"):
+        if change.get(key) is not None:
+            stations.add(int(change[key]))
+    return stations
+
+
+def _windows_overlap(a_start: int | None, a_end: int | None, b_start: int | None, b_end: int | None) -> bool:
+    """Effective-minute windows overlap; a missing window means the whole service day."""
+    if a_start is None or b_start is None:
+        return True
+    return int(a_start) < int(b_end) and int(b_start) < int(a_end)
+
+
 class DomainError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -130,6 +146,17 @@ class Database:
                     effective_end_minute INTEGER,
                     accessible INTEGER,
                     payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conflict_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    change_id INTEGER NOT NULL REFERENCES changes(id) ON DELETE CASCADE,
+                    published_version_id INTEGER NOT NULL REFERENCES versions(id),
+                    published_change_id INTEGER NOT NULL,
+                    conflict_type TEXT NOT NULL CHECK(conflict_type IN ('station','detour_od')),
+                    shared_stop_id INTEGER,
+                    details TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS import_errors (
@@ -346,6 +373,104 @@ class Database:
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def delete_change(self, change_id: int, actor: str, role: str = "viewer") -> dict[str, Any]:
+        if role not in {"planner", "editor", "admin"}:
+            raise DomainError("没有修改方案的权限", 403)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            change = conn.execute("SELECT * FROM changes WHERE id=?", (change_id,)).fetchone()
+            if not change:
+                raise DomainError("变更不存在", 404)
+            version = conn.execute("SELECT * FROM versions WHERE id=?", (change["version_id"],)).fetchone()
+            if version["status"] != "draft":
+                raise DomainError("只有草稿版本可以调整变更", 409)
+            conn.execute("DELETE FROM changes WHERE id=?", (change_id,))
+            conn.execute("UPDATE versions SET updated_at=? WHERE id=?", (utcnow(), change["version_id"]))
+            self._audit(conn, actor, "change.removed", "version", change["version_id"], {"change_id": change_id, "kind": change["kind"]})
+            return {"deleted": change_id, "version_id": change["version_id"]}
+
+    def list_conflicts(self, version_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM conflict_records WHERE version_id=? ORDER BY id", (version_id,)).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["details"] = json.loads(item["details"])
+                result.append(item)
+            return result
+
+    def _rebuild_conflicts(self, conn: sqlite3.Connection, version: sqlite3.Row) -> int:
+        """Recompute this draft's conflicts against published plans.
+
+        Called on every submit: stale records are dropped first so a
+        resubmission never keeps the previous list. A change conflicts when
+        its effective window overlaps a published change that touches the
+        same station or spans the same detour endpoints. Published versions
+        of the same disruption are earlier revisions of this plan, not
+        competing plans, so they are excluded.
+        """
+        version_id = int(version["id"])
+        conn.execute("DELETE FROM conflict_records WHERE version_id=?", (version_id,))
+        draft_changes = [dict(r) for r in conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+        if not draft_changes:
+            return 0
+        disruption = conn.execute("SELECT starts_at, ends_at FROM disruptions WHERE id=?", (version["disruption_id"],)).fetchone()
+        published = conn.execute(
+            """SELECT c.*, v.version_no, v.disruption_id, d.code disruption_code, d.name disruption_name, d.starts_at, d.ends_at
+               FROM changes c
+               JOIN versions v ON v.id=c.version_id
+               JOIN disruptions d ON d.id=v.disruption_id
+               WHERE v.status='published' AND v.disruption_id<>?""",
+            (version["disruption_id"],),
+        ).fetchall()
+        count = 0
+        for change in draft_changes:
+            stations = _change_stations(change)
+            detour_pair = None
+            if change["kind"] == "detour":
+                detour_pair = (int(change["from_stop_id"]), int(change["to_stop_id"]))
+            for other in published:
+                other_row = dict(other)
+                if not (disruption["starts_at"] < other_row["ends_at"] and other_row["starts_at"] < disruption["ends_at"]):
+                    continue
+                if not _windows_overlap(change["effective_start_minute"], change["effective_end_minute"],
+                                        other_row["effective_start_minute"], other_row["effective_end_minute"]):
+                    continue
+                other_stations = _change_stations(other_row)
+                shared = sorted(stations & other_stations)
+                other_pair = None
+                if other_row["kind"] == "detour":
+                    other_pair = (int(other_row["from_stop_id"]), int(other_row["to_stop_id"]))
+                if detour_pair and other_pair == detour_pair:
+                    count += self._emit_conflict(conn, version_id, change, other_row, "detour_od", None,
+                                                 {"detour_from_stop_id": detour_pair[0], "detour_to_stop_id": detour_pair[1]})
+                elif shared:
+                    for stop_id in shared:
+                        count += self._emit_conflict(conn, version_id, change, other_row, "station", stop_id, {})
+        return count
+
+    def _emit_conflict(self, conn: sqlite3.Connection, version_id: int, change: dict[str, Any],
+                       published: dict[str, Any], conflict_type: str, shared_stop_id: int | None,
+                       extra: dict[str, Any]) -> int:
+        details = {
+            "reason": "同一绕行起讫" if conflict_type == "detour_od" else "同一站点",
+            "change": {k: change[k] for k in ("id", "kind", "line_id", "stop_id", "from_stop_id", "to_stop_id",
+                                              "travel_minutes", "effective_start_minute", "effective_end_minute")},
+            "published_change": {k: published[k] for k in ("id", "kind", "line_id", "stop_id", "from_stop_id", "to_stop_id",
+                                                           "travel_minutes", "effective_start_minute", "effective_end_minute")},
+            "published_version": {"id": published["version_id"], "version_no": published["version_no"],
+                                  "disruption_id": published["disruption_id"], "disruption_code": published["disruption_code"],
+                                  "disruption_name": published["disruption_name"]},
+            **extra,
+        }
+        conn.execute(
+            """INSERT INTO conflict_records(version_id,change_id,published_version_id,published_change_id,conflict_type,shared_stop_id,details,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (version_id, change["id"], published["version_id"], published["id"], conflict_type, shared_stop_id,
+             json.dumps(details, ensure_ascii=False), utcnow()),
+        )
+        return 1
+
     def transition(self, version_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"planner", "editor", "reviewer", "admin"}:
             raise DomainError("没有状态流转权限", 403)
@@ -355,25 +480,34 @@ class Database:
             if not version:
                 raise DomainError("方案版本不存在", 404)
             status = version["status"]
+            conflict_count = 0
             if action == "submit":
                 if status != "draft" or role not in {"planner", "editor", "admin"}:
                     raise DomainError("只有草稿版本可以提交复核", 409)
+                conflict_count = self._rebuild_conflicts(conn, version)
                 conn.execute("UPDATE versions SET status='review',submitted_by=?,updated_at=? WHERE id=?", (actor, utcnow(), version_id))
             elif action == "reject":
                 if status != "review" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有复核版本可以退回", 409)
                 if actor == version["created_by"]:
                     raise DomainError("创建人不能自行复核", 403)
+                conn.execute("DELETE FROM conflict_records WHERE version_id=?", (version_id,))
                 conn.execute("UPDATE versions SET status='draft',submitted_by=NULL,updated_at=? WHERE id=?", (utcnow(), version_id))
             elif action == "approve":
                 if status != "review" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有复核版本可以批准", 409)
                 if actor in {version["created_by"], version["submitted_by"]}:
                     raise DomainError("创建人或提交人不能自行批准", 403)
+                conflict_count = int(conn.execute("SELECT COUNT(*) c FROM conflict_records WHERE version_id=?", (version_id,)).fetchone()["c"])
+                if conflict_count:
+                    raise DomainError(f"存在 {conflict_count} 条与已发布方案的冲突，不能直接发布，请退回调整", 409)
                 conn.execute("UPDATE versions SET status='approved',approved_by=?,updated_at=? WHERE id=?", (actor, utcnow(), version_id))
             elif action == "publish":
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
+                conflict_count = int(conn.execute("SELECT COUNT(*) c FROM conflict_records WHERE version_id=?", (version_id,)).fetchone()["c"])
+                if conflict_count:
+                    raise DomainError(f"存在 {conflict_count} 条与已发布方案的冲突，不能直接发布，请退回调整", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
                 snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
@@ -381,8 +515,12 @@ class Database:
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
             else:
                 raise DomainError("未知状态操作")
-            self._audit(conn, actor, f"version.{action}", "version", version_id, {})
-        return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+            details: dict[str, Any] = {"conflicts": conflict_count} if action == "submit" else {}
+            self._audit(conn, actor, f"version.{action}", "version", version_id, details)
+        result = dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
+        if action == "submit":
+            result["conflicts"] = self.list_conflicts(version_id)
+        return result
 
     def _base_hash(self, conn: sqlite3.Connection) -> str:
         lines = [dict(r) for r in conn.execute("SELECT * FROM lines ORDER BY id")]
@@ -533,6 +671,7 @@ class Database:
             changes = [dict(r) for r in conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
             result = dict(version)
             result["changes"] = changes
+            result["conflicts"] = self.list_conflicts(version_id)
             if result["snapshot"]:
                 result["snapshot"] = json.loads(result["snapshot"])
             return result
@@ -659,6 +798,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.add_change(int(parts[2]), actor, body, role), 201)
             if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] in {"submit", "approve", "reject", "publish"}:
                 return self._send(self.db.transition(int(parts[2]), actor, role, parts[3]))
+            raise DomainError("接口不存在", 404)
+        except (ValueError, TypeError, DomainError) as exc:
+            self._send({"error": str(exc)}, getattr(exc, "status", 400))
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            actor, role = self._auth()
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) == 3 and parts[:2] == ["api", "changes"]:
+                return self._send(self.db.delete_change(int(parts[2]), actor, role))
             raise DomainError("接口不存在", 404)
         except (ValueError, TypeError, DomainError) as exc:
             self._send({"error": str(exc)}, getattr(exc, "status", 400))
