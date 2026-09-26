@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,101 @@ class TransitFlowTest(unittest.TestCase):
         self.assertEqual(accessible["minutes"], 31)
         with self.assertRaises(DomainError):
             self.db.add_change(version, "viewer", {"kind": "stop_closure", "stop_id": self.stops["S2"]}, "viewer")
+
+
+class ConflictCheckTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self.tmp.name) / "test.db")
+        seed_demo(self.db)
+        self.stops = {row["code"]: row["id"] for row in self.db.list_stops()}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _disruption(self, code, starts, ends, actor="planner-01"):
+        return self.db.create_disruption(actor, {"code": code, "name": code + " 方案", "starts_at": starts, "ends_at": ends}, "planner")
+
+    def _publish(self, version_id, actor="planner-01", reviewer="reviewer-01"):
+        self.db.transition(version_id, actor, "planner", "submit")
+        self.db.transition(version_id, reviewer, "reviewer", "approve")
+        self.db.transition(version_id, reviewer, "reviewer", "publish")
+
+    def test_same_stop_conflict_blocks_approval_and_recomputes_on_resubmit(self):
+        va = self._disruption("D-A", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00")["draft_version_id"]
+        self.db.add_change(va, "planner-01", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
+        self._publish(va)
+
+        vb = self._disruption("D-B", "2026-09-24T22:00:00+08:00", "2026-09-25T06:00:00+08:00", "planner-02")["draft_version_id"]
+        self.db.add_change(vb, "planner-02", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
+        self.db.transition(vb, "planner-02", "planner", "submit")
+        version = self.db.get_version(vb)
+        self.assertEqual(version["status"], "review")
+        self.assertEqual(len(version["conflicts"]), 1)
+        conflict = version["conflicts"][0]
+        self.assertEqual(conflict["conflict_version_id"], va)
+        self.assertEqual(conflict["reason"], "same_stop")
+        self.assertEqual(conflict["detail"]["mine"]["stop_id"], self.stops["S4"])
+        self.assertEqual(conflict["detail"]["theirs"]["stop_id"], self.stops["S4"])
+        self.assertEqual(conflict["detail"]["conflict_disruption_code"], "D-A")
+        # Conflicting versions cannot be approved or published.
+        with self.assertRaises(DomainError):
+            self.db.transition(vb, "reviewer-02", "reviewer", "approve")
+        # Return for adjustment, then resubmit: the list is recalculated
+        # from current content instead of accumulating stale entries.
+        self.db.transition(vb, "reviewer-02", "reviewer", "reject")
+        self.assertEqual(self.db.get_version(vb)["status"], "draft")
+        self.db.add_change(vb, "planner-02", {"kind": "detour", "from_stop_id": self.stops["S1"], "to_stop_id": self.stops["S3"], "travel_minutes": 12}, "planner")
+        self.db.transition(vb, "planner-02", "planner", "submit")
+        conflicts = self.db.get_version(vb)["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["reason"], "same_stop")
+
+    def test_same_detour_endpoints_conflict(self):
+        va = self._disruption("D-C", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00")["draft_version_id"]
+        self.db.add_change(va, "planner-01", {"kind": "detour", "from_stop_id": self.stops["S1"], "to_stop_id": self.stops["S5"], "travel_minutes": 18}, "planner")
+        self._publish(va)
+
+        vb = self._disruption("D-D", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00", "planner-02")["draft_version_id"]
+        self.db.add_change(vb, "planner-02", {"kind": "detour", "from_stop_id": self.stops["S5"], "to_stop_id": self.stops["S1"], "travel_minutes": 20}, "planner")
+        self.db.transition(vb, "planner-02", "planner", "submit")
+        conflicts = self.db.get_version(vb)["conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["reason"], "same_detour")
+
+    def test_no_conflict_when_periods_or_windows_do_not_overlap(self):
+        va = self._disruption("D-E", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00")["draft_version_id"]
+        self.db.add_change(va, "planner-01", {"kind": "stop_closure", "stop_id": self.stops["S4"], "effective_start_minute": 1200, "effective_end_minute": 1260}, "planner")
+        self._publish(va)
+
+        # Different disruption period: no conflict, flow proceeds as usual.
+        vb = self._disruption("D-F", "2026-09-26T20:00:00+08:00", "2026-09-27T02:00:00+08:00", "planner-02")["draft_version_id"]
+        self.db.add_change(vb, "planner-02", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
+        self._publish(vb, "planner-02", "reviewer-02")
+        self.assertEqual(self.db.get_version(vb)["status"], "published")
+
+        # Overlapping period but disjoint effective windows: no conflict.
+        vc = self._disruption("D-G", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00", "planner-02")["draft_version_id"]
+        self.db.add_change(vc, "planner-02", {"kind": "stop_closure", "stop_id": self.stops["S4"], "effective_start_minute": 1260, "effective_end_minute": 1320}, "planner")
+        self._publish(vc, "planner-02", "reviewer-02")
+        self.assertEqual(self.db.get_version(vc)["status"], "published")
+
+    def test_publish_rechecks_conflicts_against_newly_published_plans(self):
+        va = self._disruption("D-H", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00")["draft_version_id"]
+        self.db.add_change(va, "planner-01", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
+
+        # B is submitted and approved while A is still unpublished: no conflict yet.
+        vb = self._disruption("D-I", "2026-09-24T20:00:00+08:00", "2026-09-25T02:00:00+08:00", "planner-02")["draft_version_id"]
+        self.db.add_change(vb, "planner-02", {"kind": "stop_closure", "stop_id": self.stops["S4"]}, "planner")
+        self.db.transition(vb, "planner-02", "planner", "submit")
+        self.assertEqual(self.db.get_version(vb)["conflicts"], [])
+        self.db.transition(vb, "reviewer-02", "reviewer", "approve")
+
+        # A gets published first; B's publish must be re-checked and blocked.
+        self._publish(va)
+        with self.assertRaises(DomainError):
+            self.db.transition(vb, "reviewer-02", "reviewer", "publish")
+        self.assertEqual(self.db.get_version(vb)["status"], "approved")
 
 
 if __name__ == "__main__":

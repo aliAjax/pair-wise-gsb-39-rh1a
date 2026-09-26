@@ -19,6 +19,7 @@ python app.py --port 8010
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
 - 发布在一个 SQLite 事务内写入方案快照和 SHA-256，旧发布版本不会被覆盖。
+- 提交复核时自动比对待提交草稿与其他事件已发布方案的生效时段；两条方案涉及同一站或同一绕行起讫（分钟窗口还需重叠）时，冲突版本与具体变更写入 `conflicts`。审批清单展示冲突，存在冲突的版本不能批准或发布，可退回调整；再次提交按新内容重算并清除旧清单，发布前还会针对新上架的方案再复核一次。
 
 ## API
 
@@ -28,7 +29,8 @@ python app.py --port 8010
 - `POST /api/disruptions`：创建中断事件及第一版草稿。
 - `POST /api/disruptions/{id}/versions`：从指定父版本复制出新草稿。
 - `POST /api/versions/{id}/changes`：向草稿添加停运、跳站、绕行或无障碍变化。
-- `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程。
+- `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程；提交时重算冲突清单，有冲突的版本批准和发布会被拒绝。
+- `GET /api/versions/{id}`：查看版本详情、变更和 `conflicts` 冲突清单（冲突版本、原因和双方具体变更）。
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
 - `GET /api/import-errors`：查看被隔离的错误批次。
@@ -39,4 +41,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻、坏数据整批隔离，以及方案冲突的检测、审批拦截、退回重算和发布前复核。

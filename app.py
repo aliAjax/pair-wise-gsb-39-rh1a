@@ -42,6 +42,58 @@ def _within_window(value: int, start: int | None, end: int | None) -> bool:
     return start <= value <= end
 
 
+def _change_stops(change: sqlite3.Row) -> set[int]:
+    """Stops a change touches: its stop_id plus detour endpoints."""
+    stops: set[int] = set()
+    if change["stop_id"] is not None:
+        stops.add(int(change["stop_id"]))
+    if change["kind"] == "detour":
+        stops.add(int(change["from_stop_id"]))
+        stops.add(int(change["to_stop_id"]))
+    return stops
+
+
+def _windows_overlap(a: sqlite3.Row, b: sqlite3.Row) -> bool:
+    """A change without an effective window applies all day."""
+    a_start, a_end = a["effective_start_minute"], a["effective_end_minute"]
+    b_start, b_end = b["effective_start_minute"], b["effective_end_minute"]
+    if a_start is None or b_start is None:
+        return True
+    return int(a_start) < int(b_end) and int(b_start) < int(a_end)
+
+
+def _conflict_reason(mine: sqlite3.Row, theirs: sqlite3.Row) -> str | None:
+    if not _windows_overlap(mine, theirs):
+        return None
+    if mine["kind"] == "detour" and theirs["kind"] == "detour":
+        my_pair = {int(mine["from_stop_id"]), int(mine["to_stop_id"])}
+        their_pair = {int(theirs["from_stop_id"]), int(theirs["to_stop_id"])}
+        if my_pair == their_pair:
+            return "same_detour"
+    if _change_stops(mine) & _change_stops(theirs):
+        return "same_stop"
+    return None
+
+
+def _change_brief(change: sqlite3.Row, stop_codes: dict[int, str]) -> dict[str, Any]:
+    def code(stop_id: Any) -> str | None:
+        return stop_codes.get(int(stop_id)) if stop_id is not None else None
+
+    return {
+        "change_id": int(change["id"]),
+        "kind": change["kind"],
+        "stop_id": change["stop_id"],
+        "stop_code": code(change["stop_id"]),
+        "from_stop_id": change["from_stop_id"],
+        "from_stop_code": code(change["from_stop_id"]),
+        "to_stop_id": change["to_stop_id"],
+        "to_stop_code": code(change["to_stop_id"]),
+        "travel_minutes": change["travel_minutes"],
+        "effective_start_minute": change["effective_start_minute"],
+        "effective_end_minute": change["effective_end_minute"],
+    }
+
+
 class DomainError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -130,6 +182,16 @@ class Database:
                     effective_end_minute INTEGER,
                     accessible INTEGER,
                     payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                    conflict_version_id INTEGER NOT NULL REFERENCES versions(id),
+                    change_id INTEGER,
+                    conflict_change_id INTEGER,
+                    reason TEXT NOT NULL,
+                    detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS import_errors (
@@ -346,6 +408,46 @@ class Database:
             self._audit(conn, actor, "change.added", "version", version_id, {"kind": kind, "change_id": cur.lastrowid})
             return dict(conn.execute("SELECT * FROM changes WHERE id=?", (cur.lastrowid,)).fetchone())
 
+    def _detect_conflicts(self, conn: sqlite3.Connection, version_id: int) -> list[dict[str, Any]]:
+        """Compare a version's changes against published plans of other
+        disruptions whose effective periods overlap. Returns one entry per
+        conflicting change pair."""
+        version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
+        disruption = conn.execute("SELECT * FROM disruptions WHERE id=?", (version["disruption_id"],)).fetchone()
+        mine = conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()
+        if not mine:
+            return []
+        stop_codes = {int(r["id"]): r["code"] for r in conn.execute("SELECT id,code FROM stops")}
+        published = conn.execute(
+            """SELECT v.id, v.version_no, d.code disruption_code, d.name disruption_name
+               FROM versions v JOIN disruptions d ON d.id = v.disruption_id
+               WHERE v.status='published' AND v.disruption_id<>? AND d.starts_at<? AND d.ends_at>?""",
+            (version["disruption_id"], disruption["ends_at"], disruption["starts_at"]),
+        ).fetchall()
+        conflicts: list[dict[str, Any]] = []
+        for other in published:
+            theirs = conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (other["id"],)).fetchall()
+            for my_change in mine:
+                for their_change in theirs:
+                    reason = _conflict_reason(my_change, their_change)
+                    if reason is None:
+                        continue
+                    conflicts.append({
+                        "conflict_version_id": int(other["id"]),
+                        "change_id": int(my_change["id"]),
+                        "conflict_change_id": int(their_change["id"]),
+                        "reason": reason,
+                        "detail": {
+                            "reason_text": "同一绕行起讫" if reason == "same_detour" else "涉及同一站点",
+                            "conflict_disruption_code": other["disruption_code"],
+                            "conflict_disruption_name": other["disruption_name"],
+                            "conflict_version_no": other["version_no"],
+                            "mine": _change_brief(my_change, stop_codes),
+                            "theirs": _change_brief(their_change, stop_codes),
+                        },
+                    })
+        return conflicts
+
     def transition(self, version_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
         if role not in {"planner", "editor", "reviewer", "admin"}:
             raise DomainError("没有状态流转权限", 403)
@@ -355,9 +457,21 @@ class Database:
             if not version:
                 raise DomainError("方案版本不存在", 404)
             status = version["status"]
+            audit_details: dict[str, Any] = {}
             if action == "submit":
                 if status != "draft" or role not in {"planner", "editor", "admin"}:
                     raise DomainError("只有草稿版本可以提交复核", 409)
+                # Recalculate conflicts against published plans on every
+                # submission; stale lists from previous submits are removed.
+                conn.execute("DELETE FROM conflicts WHERE version_id=?", (version_id,))
+                conflicts = self._detect_conflicts(conn, version_id)
+                for conflict in conflicts:
+                    conn.execute(
+                        "INSERT INTO conflicts(version_id,conflict_version_id,change_id,conflict_change_id,reason,detail,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (version_id, conflict["conflict_version_id"], conflict["change_id"], conflict["conflict_change_id"],
+                         conflict["reason"], canonical(conflict["detail"]), utcnow()),
+                    )
+                audit_details["conflicts"] = len(conflicts)
                 conn.execute("UPDATE versions SET status='review',submitted_by=?,updated_at=? WHERE id=?", (actor, utcnow(), version_id))
             elif action == "reject":
                 if status != "review" or role not in {"reviewer", "admin"}:
@@ -370,10 +484,16 @@ class Database:
                     raise DomainError("只有复核版本可以批准", 409)
                 if actor in {version["created_by"], version["submitted_by"]}:
                     raise DomainError("创建人或提交人不能自行批准", 403)
+                if conn.execute("SELECT 1 FROM conflicts WHERE version_id=? LIMIT 1", (version_id,)).fetchone():
+                    raise DomainError("存在与已发布方案的冲突，不能批准，请退回调整", 409)
                 conn.execute("UPDATE versions SET status='approved',approved_by=?,updated_at=? WHERE id=?", (actor, utcnow(), version_id))
             elif action == "publish":
                 if status != "approved" or role not in {"reviewer", "admin"}:
                     raise DomainError("只有已批准版本可以发布", 409)
+                # Re-check at publish time: another plan may have been
+                # published after this version was approved.
+                if self._detect_conflicts(conn, version_id):
+                    raise DomainError("存在与已发布方案的冲突，不能发布，请退回调整", 409)
                 changes = [dict(r) for r in conn.execute("SELECT kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,effective_start_minute,effective_end_minute,accessible,payload FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
                 snapshot = {"version_id": version_id, "disruption_id": version["disruption_id"], "version_no": version["version_no"], "changes": changes, "base_hash": self._base_hash(conn)}
                 snapshot_text = canonical(snapshot)
@@ -381,7 +501,7 @@ class Database:
                 conn.execute("UPDATE versions SET status='published',snapshot_hash=?,snapshot=?,published_at=?,updated_at=? WHERE id=?", (digest, snapshot_text, utcnow(), utcnow(), version_id))
             else:
                 raise DomainError("未知状态操作")
-            self._audit(conn, actor, f"version.{action}", "version", version_id, {})
+            self._audit(conn, actor, f"version.{action}", "version", version_id, audit_details)
         return dict(conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone())
 
     def _base_hash(self, conn: sqlite3.Connection) -> str:
@@ -531,8 +651,14 @@ class Database:
             if not version:
                 raise DomainError("方案版本不存在", 404)
             changes = [dict(r) for r in conn.execute("SELECT * FROM changes WHERE version_id=? ORDER BY id", (version_id,)).fetchall()]
+            conflicts = []
+            for row in conn.execute("SELECT * FROM conflicts WHERE version_id=? ORDER BY id", (version_id,)).fetchall():
+                item = dict(row)
+                item["detail"] = json.loads(item["detail"])
+                conflicts.append(item)
             result = dict(version)
             result["changes"] = changes
+            result["conflicts"] = conflicts
             if result["snapshot"]:
                 result["snapshot"] = json.loads(result["snapshot"])
             return result
